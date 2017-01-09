@@ -101,6 +101,7 @@ import os
 import re
 import sys
 import socket
+import traceback
 import platform
 import tempfile
 import base64
@@ -180,6 +181,14 @@ if not HAS_SSLCONTEXT and HAS_SSL:
             except AttributeError:
                 pass
         del libssl
+
+
+def jamie_log(*args, **kwargs):
+    with open(os.path.expanduser('~/ansible-log.txt'), 'a') as f:
+        f.write(*args, **kwargs)
+
+
+jamie_log('#############################################')
 
 
 HAS_MATCH_HOSTNAME = True
@@ -520,7 +529,7 @@ def RedirectHandlerFactory(follow_redirects=None, validate_certs=True):
     return RedirectHandler
 
 
-def build_ssl_validation_error(hostname, port, paths):
+def build_ssl_validation_error(hostname, port, paths, exc=None, tb=None):
     '''Inteligently build out the SSLValidationError based on what support
     you have installed
     '''
@@ -543,6 +552,12 @@ def build_ssl_validation_error(hostname, port, paths):
                ' not need to confirm the servers identity but this is'
                ' unsafe and not recommended.'
                ' Paths checked for this platform: %s')
+
+    if exc:
+        msg.append('Exception: %s' % exc)
+
+    if tb:
+        msg.extend(traceback.format_list(tb))
 
     raise SSLValidationError(' '.join(msg) % (hostname, port, ", ".join(paths)))
 
@@ -606,13 +621,14 @@ class SSLValidationHandler(urllib_request.BaseHandler):
                 for f in dir_contents:
                     full_path = os.path.join(path, f)
                     if os.path.isfile(full_path) and os.path.splitext(f)[1] in ('.crt','.pem'):
+                        jamie_log("adding file to cacert temp: %s" % full_path)
                         try:
                             cert_file = open(full_path, 'rb')
                             os.write(tmp_fd, cert_file.read())
                             os.write(tmp_fd, b('\n'))
                             cert_file.close()
-                        except (OSError, IOError):
-                            pass
+                        except (OSError, IOError) as e:
+                            jamie_log("**** Failed to add file %s to cacert temp: %s" % (full_path, e))
 
         return (tmp_path, paths_checked)
 
@@ -665,6 +681,7 @@ class SSLValidationHandler(urllib_request.BaseHandler):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             if https_proxy:
+                jamie_log("!! https_proxy found?")
                 proxy_parts = generic_urlparse(urlparse(https_proxy))
                 port = proxy_parts.get('port') or 443
                 s.connect((proxy_parts.get('hostname'), port))
@@ -693,6 +710,7 @@ class SSLValidationHandler(urllib_request.BaseHandler):
             else:
                 s.connect((self.hostname, self.port))
                 if context:
+                    jamie_log("wrapping ssl in context")
                     ssl_s = context.wrap_socket(s, server_hostname=self.hostname)
                 elif HAS_URLLIB3_SNI_SUPPORT:
                     ssl_s = ssl_wrap_socket(s, ca_certs=tmp_ca_cert_path, cert_reqs=ssl.CERT_REQUIRED, ssl_version=PROTOCOL, server_hostname=self.hostname)
@@ -708,9 +726,13 @@ class SSLValidationHandler(urllib_request.BaseHandler):
             if 'connection refused' in str(e).lower():
                 raise ConnectionError('Failed to connect to %s:%s.' % (self.hostname, self.port))
             else:
-                build_ssl_validation_error(self.hostname, self.port, paths_checked)
-        except CertificateError:
-            build_ssl_validation_error(self.hostname, self.port, paths_checked)
+                tb = traceback.extract_stack()
+                build_ssl_validation_error(self.hostname, self.port, paths_checked, e, tb)
+        except CertificateError as e:
+            tb = traceback.extract_stack()
+            build_ssl_validation_error(self.hostname, self.port, paths_checked, e, tb)
+
+        jamie_log("removing tmp ca file: %s" % tmp_ca_cert_path)
 
         try:
             # cleanup the temp file created, don't worry
